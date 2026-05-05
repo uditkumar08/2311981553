@@ -42,12 +42,28 @@ exports.schedule = async (req, res, next) => {
       return res.status(404).json({ message: 'Depot not found' });
     }
 
-    const maxImpact = optimizeSchedule(vehicles, depot.maxHours);
+    const result = optimizeSchedule(vehicles, depot.maxHours);
 
     res.json({
       depotId,
       maxHours: depot.maxHours,
-      maxImpact,
+      totalScore: result.totalScore,
+      selectedTaskIds: result.selectedTaskIds,
+      selectedVehicles: result.selectedVehicles.map((v) => ({
+        taskId: v.taskId,
+        duration: v.duration,
+        impact: v.impact,
+      })),
+      depotHoursUsed: result.totalDuration,
+      depotHoursAvailable: result.depotHoursAvailable,
+      optimization: {
+        vehiclesConsidered: vehicles.length,
+        vehiclesSelected: result.selectedTaskIds.length,
+        utilizationRate:
+          ((result.totalDuration / result.depotHoursAvailable) * 100).toFixed(
+            2,
+          ) + "%",
+      },
       source: depots.length > 2 ? "external API" : "fallback data"
     });
 
