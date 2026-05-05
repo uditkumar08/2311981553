@@ -1,85 +1,216 @@
-const notificationService = require('../notification_app_be/notification.service');
+const axios = require("axios");
 
-function priorityInboxHandler(req, res) {
+const PRIORITY_WEIGHTS = {
+  Placement: 3,
+  Result: 2,
+  Event: 1,
+};
+
+/**
+
+ * @param {string} studentId
+ * @returns {Promise<Array>}
+ */
+async function fetchAndPrioritizeNotifications(studentId) {
+  try {
+    if (!studentId) {
+      throw new Error("Student ID is required");
+    }
+
+    const authToken = process.env.AUTH_TOKEN || "default-token";
+
+    const response = await axios.get(
+      "http://20.207.122.201/evaluation-service/notifications",
+      {
+        params: {
+          studentId: studentId,
+        },
+        timeout: 10000,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+      },
+    );
+
+    if (!response.data || !Array.isArray(response.data)) {
+      throw new Error("Invalid response format from notifications service");
+    }
+
+    const notifications = response.data;
+
+    const prioritizedNotifications = notifications
+      .map((notification) => {
+        if (!notification.type || !notification.timestamp) {
+          return null;
+        }
+
+        const weight = PRIORITY_WEIGHTS[notification.type] || 0;
+
+        return {
+          ...notification,
+          weight: weight,
+          sortKey: {
+            weight: weight,
+            timestamp: new Date(notification.timestamp).getTime(),
+          },
+        };
+      })
+      .filter((n) => n !== null)
+      .sort((a, b) => {
+        if (a.sortKey.weight !== b.sortKey.weight) {
+          return b.sortKey.weight - a.sortKey.weight;
+        }
+
+        return b.sortKey.timestamp - a.sortKey.timestamp;
+      })
+      .slice(0, 10)
+      .map(({ sortKey, ...notification }) => notification);
+    return {
+      success: true,
+      count: prioritizedNotifications.length,
+      notifications: prioritizedNotifications,
+      metadata: {
+        totalRetrieved: notifications.length,
+        studentId: studentId,
+        timestamp: new Date().toISOString(),
+      },
+    };
+  } catch (error) {
+    if (error.response) {
+      return {
+        success: false,
+        error: `Service error: ${error.response.status} - ${error.response.statusText}`,
+        count: 0,
+        notifications: [],
+        metadata: {
+          studentId: studentId,
+          timestamp: new Date().toISOString(),
+        },
+      };
+    } else if (error.request) {
+      return {
+        success: false,
+        error: "Failed to reach notifications service. Please try again.",
+        count: 0,
+        notifications: [],
+        metadata: {
+          studentId: studentId,
+          timestamp: new Date().toISOString(),
+        },
+      };
+    } else {
+      return {
+        success: false,
+        error: "Error processing request: " + error.message,
+        count: 0,
+        notifications: [],
+        metadata: {
+          studentId: studentId,
+          timestamp: new Date().toISOString(),
+        },
+      };
+    }
+  }
+}
+
+async function priorityInboxHandler(req, res) {
   try {
     const { studentId } = req.params;
 
-    // Get all notifications for the student
-    const allNotifications = notificationService.getNotifications();
-    const studentNotifications = allNotifications.filter(n => n.student_id == studentId);
-
-    // Sort by priority (assuming higher impact or newer first, but since no priority field, sort by createdAt desc)
-    const sortedNotifications = studentNotifications.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-
-    // Take top 10
-    const top10 = sortedNotifications.slice(0, 10);
-
-    res.status(200).json({
-      studentId,
-      notifications: top10,
-      total: studentNotifications.length,
-      returned: top10.length
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: "Error fetching priority inbox: " + error.message,
-    });
-  }
-}
-
-function priorityInboxBatchHandler(req, res) {
-  try {
-    const { studentIds } = req.body;
-
-    if (!Array.isArray(studentIds)) {
+    if (!studentId || isNaN(studentId)) {
       return res.status(400).json({
-        error: "studentIds must be an array",
+        success: false,
+        error: "Invalid student ID format",
       });
     }
 
-    const results = {};
-    const allNotifications = notificationService.getNotifications();
+    const result = await fetchAndPrioritizeNotifications(studentId);
 
-    studentIds.forEach(studentId => {
-      const studentNotifications = allNotifications.filter(n => n.student_id == studentId);
-      const sortedNotifications = studentNotifications.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-      results[studentId] = sortedNotifications.slice(0, 10);
-    });
-
-    res.status(200).json({
-      results,
-      requested: studentIds.length
-    });
+    if (result.success) {
+      return res.status(200).json(result);
+    } else {
+      return res.status(503).json(result);
+    }
   } catch (error) {
-    res.status(500).json({
-      error: "Error fetching priority inbox batch: " + error.message,
+    return res.status(500).json({
+      success: false,
+      error: "Internal server error: " + error.message,
+      count: 0,
+      notifications: [],
     });
   }
 }
 
-function getPriorityStatsHandler(req, res) {
+async function priorityInboxBatchHandler(req, res) {
   try {
-    // Dummy priority weights
-    const priorityWeights = {
-      urgent: 100,
-      important: 80,
-      normal: 50,
-      low: 20
-    };
+    const { studentIds } = req.body;
 
-    res.status(200).json({
-      priorityWeights,
-      description: "Priority weights for notification sorting"
+    if (!Array.isArray(studentIds) || studentIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "studentIds must be a non-empty array",
+      });
+    }
+
+    const promises = studentIds.map((id) =>
+      fetchAndPrioritizeNotifications(id).catch((error) => ({
+        success: false,
+        error: error.message,
+        studentId: id,
+        notifications: [],
+      })),
+    );
+
+    const results = await Promise.all(promises);
+
+    return res.status(200).json({
+      success: true,
+      data: results,
+      totalStudents: studentIds.length,
+      successfulFetches: results.filter((r) => r.success).length,
+      failedFetches: results.filter((r) => !r.success).length,
     });
   } catch (error) {
-    res.status(500).json({
-      error: "Error fetching priority stats: " + error.message,
+    return res.status(500).json({
+      success: false,
+      error: "Error processing batch request: " + error.message,
+    });
+  }
+}
+
+async function getPriorityStatsHandler(req, res) {
+  try {
+    return res.status(200).json({
+      success: true,
+      priorityWeights: PRIORITY_WEIGHTS,
+      description: {
+        Placement: {
+          weight: 3,
+          description: "Highest priority - placement-related notifications",
+        },
+        Result: {
+          weight: 2,
+          description: "Medium priority - academic results and scores",
+        },
+        Event: {
+          weight: 1,
+          description: "Low priority - general events and announcements",
+        },
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: "Error fetching priority statistics: " + error.message,
     });
   }
 }
 
 module.exports = {
+  fetchAndPrioritizeNotifications,
   priorityInboxHandler,
   priorityInboxBatchHandler,
   getPriorityStatsHandler,
+  PRIORITY_WEIGHTS,
 };
